@@ -1,66 +1,94 @@
-
 import tkinter as tk
 from tkinter import messagebox
-import sqlite3
-import hashlib
-import hmac
-from pathlib import Path
-from modulo_libros import mostrar_formulario_libro
+import requests
+import threading
 
+from google.cloud.firestore_v1.base_query import FieldFilter
+
+from firebase_config import db
+from modulo_libros import mostrar_formulario_libro
 # Ubicación de la base de datos
-RUTA_DB = Path(__file__).resolve().parent / "data" / "gestion_libros.db"
+FIREBASE_API_KEY = "AIzaSyDVB5d2f6SYMnOql9vhUwDyY8qVRxOnC5E"
+
 
 
 # -----------------------------------------
 # VERIFICAR CONTRASEÑA
 # -----------------------------------------
-def verificar_contrasena(contrasena, almacenada):
-    try:
-        algoritmo, iteraciones, salt, hash_original = almacenada.split("$")
-
-        if algoritmo != "pbkdf2_sha256":
-            return False
-
-        nuevo_hash = hashlib.pbkdf2_hmac(
-            "sha256",
-            contrasena.encode("utf-8"),
-            salt.encode("utf-8"),
-            int(iteraciones)
-        ).hex()
-
-        return hmac.compare_digest(nuevo_hash, hash_original)
-
-    except (ValueError, TypeError):
-        return False
-
-
-# -----------------------------------------
-# AUTENTICAR USUARIO
-# -----------------------------------------
 def autenticar(usuario, contrasena):
-    conexion = sqlite3.connect(RUTA_DB)
-    cursor = conexion.cursor()
+    try:
+        print("1. Buscando usuario en Firestore...")
 
-    cursor.execute("""
-        SELECT nombre, usuario, contrasena, rol
-        FROM usuarios
-        WHERE usuario = ?
-    """, (usuario,))
+        resultados = (
+            db.collection("usuarios")
+            .where(filter=FieldFilter("usuario", "==", usuario))
+            .limit(1)
+            .get(timeout=10)
+        )
 
-    resultado = cursor.fetchone()
-    conexion.close()
+        print("2. Consulta de Firestore finalizada.")
 
-    if resultado is None:
-        return None
+        if not resultados:
+            print("3. Usuario no encontrado.")
+            return None
 
-    nombre, usuario_db, hash_guardado, rol = resultado
+        documento = resultados[0]
+        datos = documento.to_dict()
 
-    if verificar_contrasena(contrasena, hash_guardado):
+        email = datos.get("email")
+
+        if not email:
+            print("3. El usuario no tiene correo.")
+            return None
+
+        print("4. Usuario encontrado. Validando contraseña...")
+
+        url = (
+            "https://identitytoolkit.googleapis.com/v1/"
+            "accounts:signInWithPassword"
+            f"?key={FIREBASE_API_KEY}"
+        )
+
+        respuesta = requests.post(
+            url,
+            json={
+                "email": email,
+                "password": contrasena,
+                "returnSecureToken": True
+            },
+            timeout=15
+        )
+
+        print("5. Firebase Authentication respondió.")
+
+        if respuesta.status_code != 200:
+            print("6. Credenciales rechazadas.")
+            return None
+
+        usuario_auth = respuesta.json()
+
+        if usuario_auth.get("localId") != documento.id:
+            print("7. Los UID no coinciden.")
+            return None
+
+        nombre = datos.get("nombre")
+        rol = datos.get("rol")
+
+        if rol not in ("administrador", "empleado", "proveedor"):
+            print("8. Rol no válido.")
+            return None
+
+        print("9. Inicio de sesión exitoso.")
         return nombre, rol
 
-    return None
+    except requests.RequestException as error:
+        raise Exception(
+            "No se pudo conectar con Firebase Authentication."
+        ) from error
 
-
+    except Exception as error:
+        print("ERROR EN AUTENTICAR:", repr(error))
+        raise
 # -----------------------------------------
 # MOSTRAR CONTENIDO DE CADA SECCIÓN
 # -----------------------------------------
@@ -291,31 +319,51 @@ def iniciar_sesion():
         )
         return
 
-    if not RUTA_DB.exists():
+    boton_login.config(state="disabled", text="CONECTANDO...")
+
+    def ejecutar_autenticacion():
+        try:
+            resultado = autenticar(usuario, contrasena)
+            error = None
+
+        except Exception as excepcion:
+            resultado = None
+            error = str(excepcion)
+
+        ventana.after(
+            0,
+            lambda: finalizar_autenticacion(resultado, error)
+        )
+
+    threading.Thread(
+        target=ejecutar_autenticacion,
+        daemon=True
+    ).start()
+
+
+def finalizar_autenticacion(resultado, error):
+    if not ventana.winfo_exists():
+        return
+
+    boton_login.config(state="normal", text="INICIAR SESIÓN")
+
+    if error:
         messagebox.showerror(
-            "Error",
-            "No se encuentra la base de datos."
+            "Error de conexión",
+            error
         )
         return
 
-    try:
-        resultado = autenticar(usuario, contrasena)
+    if resultado:
+        nombre, rol = resultado
+        mostrar_panel(nombre, rol)
 
-        if resultado:
-            nombre, rol = resultado
-            mostrar_panel(nombre, rol)
-        else:
-            messagebox.showerror(
-                "Acceso denegado",
-                "Usuario o contraseña incorrectos."
-            )
-            entrada_contrasena.delete(0, tk.END)
-
-    except sqlite3.Error as error:
+    else:
         messagebox.showerror(
-            "Error de base de datos",
-            str(error)
+            "Acceso denegado",
+            "Usuario o contraseña incorrectos."
         )
+        entrada_contrasena.delete(0, tk.END)
 
 
 # -----------------------------------------
@@ -369,7 +417,9 @@ def construir_login():
     )
     entrada_contrasena.pack()
 
-    tk.Button(
+    global boton_login
+
+    boton_login = tk.Button(
         ventana,
         text="INICIAR SESIÓN",
         font=("Arial", 12, "bold"),
@@ -377,7 +427,8 @@ def construir_login():
         fg="white",
         width=22,
         command=iniciar_sesion
-    ).pack(pady=30)
+    )
+    boton_login.pack(pady=30)
 
     ventana.bind("<Return>", lambda event: iniciar_sesion())
     entrada_usuario.focus()
